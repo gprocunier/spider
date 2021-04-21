@@ -1,0 +1,288 @@
+#
+# spider.yml - create an ad-hoc hub/spoke SDN (ethernet-tap-over-ssh)
+#              with nat gateway capability
+#
+#              by greg.procunier@gmail.com 04/11/18
+#
+# usage: ansible-playbook -i <inventory of hosts to mesh> spider.yml
+#
+# requirements: root access on the hub
+#               root access on the spokes (via ssh key)
+#               RHEL 6 or 7
+---
+- name: spider-prep
+  hosts: all
+  vars:
+    cleanOldTunnels: true
+    ip: "/bin/env ip"
+    grep: "/bin/env grep"
+  handlers:
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted
+  tasks:
+    - shell: /bin/env true
+      register: normal_operation
+    - name: Wipe old PermitTunnel definitions in /etc/ssh/sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitTunnel (?!ethernet)'
+        state: absent
+    - name: Configure Layer 2 Tunneling in /etc/ssh/sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: 'PermitTunnel ethernet'
+      notify: restart sshd
+    - name: ensure that the tun module is loaded in the kernel
+      modprobe:
+        name: tun
+        state: present
+    - name: Tear down any existing tap0 devices
+      shell:
+        cmd: |
+            if {{ grep }} tap0 /proc/net/dev
+            then
+              {{ ip }} link delete tap0 || exit 1
+            fi
+      when:
+        cleanOldTunnels == true
+      tags:
+        - cleanup
+    - name: Iptables -> Ensure ingress on tap0 is accepted
+      iptables:
+        action: insert
+        chain: INPUT
+        jump: ACCEPT
+        in_interface: tap0
+      become: yes
+      tags: configFw
+    - name: Iptables -> Ensure egress on tap0 is accepted
+      iptables:
+        action: insert
+        chain: OUTPUT
+        jump: ACCEPT
+        out_interface: tap0
+      become: yes
+      tags: configFw
+    - name: Iptables -> Enable ip masquerading on the masqGw interface
+      iptables:
+        action: insert
+        table: nat
+        chain: POSTROUTING
+        jump: MASQUERADE
+        out_interface: "{{ masqEgress | default('eth0') }}"
+      when: inventory_hostname in groups['masqGw']
+    - name: Iptables -> Allow packet forwarding from tap0 to masqEgress device
+      iptables:
+        action: insert
+        chain: FORWARD
+        in_interface: tap0
+        out_interface: "{{ masqEgress | default('eth0') }}"
+        jump: ACCEPT
+      when: inventory_hostname in groups['masqGw']
+    - name: Iptables -> Allow related and established packet flows back across the masqGw
+      iptables:
+        action: insert
+        chain: FORWARD
+        in_interface: tap0
+        out_interface: "{{ masqEgress | default('eth0') }}"
+        ctstate: RELATED,ESTABLISHED
+        jump: ACCEPT
+      when: inventory_hostname in groups['masqGw']
+    - name: Enable ip forwarding on the masqGw
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1 
+        sysctl_set: yes
+      when: inventory_hostname in groups['masqGw']
+    - name: Iptables -> remove ingress on tap0
+      iptables:
+        action: insert
+        chain: INPUT
+        jump: ACCEPT
+        in_interface: tap0
+        state: absent
+      become: yes
+      when: normal_operation is not defined
+      tags: cleanup
+    - name: Iptables -> remove egress on tap0
+      iptables:
+        action: insert
+        chain: OUTPUT
+        jump: ACCEPT
+        out_interface: tap0
+        state: absent
+      become: yes
+      when: normal_operation is not defined
+      tags: cleanup
+    - name: Iptables -> remove masquerading on masqGw
+      iptables:
+        action: insert
+        table: nat
+        chain: POSTROUTING
+        jump: MASQUERADE
+        out_interface: "{{ masqEgress | default('eth0') }}"
+        state: absent
+      become: yes
+      when: inventory_hostname in groups['masqGw'] and normal_operation is not defined
+      tags: cleanup
+    - name: Iptables -> remove forwarding on tap0
+      iptables:
+        action: insert
+        chain: FORWARD
+        in_interface: tap0
+        out_interface: "{{ masqEgress | default('eth0') }}"
+        jump: ACCEPT
+        state: absent
+      become: yes
+      when: inventory_hostname in groups['masqGw'] and normal_operation is not defined
+      tags: cleanup
+    - name: Iptables -> remove related session access on tap0
+      iptables:
+        action: insert
+        chain: FORWARD
+        in_interface: tap0
+        out_interface: "{{ masqEgress | default('eth0') }}"
+        ctstate: RELATED,ESTABLISHED
+        jump: ACCEPT
+        state: absent
+      become: yes
+      when: inventory_hostname in groups['masqGw'] and normal_operation is not defined
+      tags: cleanup
+    - name: Disable ip forwarding on the masqGw
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 0
+        sysctl_set: yes
+      when: inventory_hostname in groups['masqGw'] and normal_operation is not defined
+      tags: cleanup
+- name: Create a ether-tap-over-ssh2 mesh network
+  hosts: "{{ hubFqdn | default('localhost') }}"
+  vars:
+    sshOpts: "-o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes -q"
+    tapSubnet: "172.31.100"
+    tapUpTime: 7
+    tapMask: 24
+    tapSvi: 1
+    tapTable: 12345
+    cleanOldTunnels: true
+    configSpokeFw: true
+    sshProcessName: "ssh-tap-spoke"
+    ip: "/bin/env ip"
+    grep: "/bin/env grep"
+    pkill: "/bin/env pkill"
+    brctl: "/bin/env brctl"
+    rpm: "/bin/env rpm"
+    ping: "/bin/env ping"
+    ssh: "/bin/env which ssh"
+    nohup: "/bin/env nohup"
+    forwarding: true
+  tasks:
+    - shell: /bin/env true
+      register: normal_operation
+    - name: disable forwarding (cleanup only)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 0
+        sysctl_set: yes
+      when: normal_operation is not defined
+      tags: cleanup
+    - name: Iptables -> remove ingress on tap0
+      modprobe:
+        name: tun
+        state: present
+      tags: kernel
+    - name: remove tunnel policy routing
+      shell:
+        cmd: |
+          if [[ ! -z $({{ ip }} route list {{ tapSubnet }}.{{ tapSvi }} scope link dev hub) ]]
+          then
+            {{ ip }} route delete {{ tapSubnet }}.{{ tapSvi }} scope link dev hub || exit 1
+          fi
+          if [[ ! -z $({{ ip }} rule list | {{ grep }} "from {{ tapSubnet }}.0/{{ tapMask }} lookup {{ tapTable }}")  ]]
+          then
+            {{ ip }} rule delete from {{ tapSubnet }}.0/{{ tapMask }} table {{ tapTable }} || exit 2
+          fi
+          if [[ ! -z $({{ ip }} route list default via {{ tapSubnet }}.{{ tapSvi }} dev hub table {{ tapTable }}) ]]
+          then
+            {{ ip }} route delete default via {{ tapSubnet }}.{{ tapSvi }} dev hub table {{ tapTable }} || exit 3
+          fi
+      register: policyRouteCleanup
+      failed_when: policyRouteCleanup.rc > 0
+      tags: cleanup
+    - name: checking bastion (hub) for pre-existing tunnels
+      shell: /bin/env true
+      failed_when:
+        (item | regex_search('^tap\d+')) and cleanOldTunnels == false
+      with_items: "{{ ansible_interfaces }}"
+      tags: tunnel_check
+    - name: Tear down any existing tunnel networks ( requires override )
+      shell:
+        cmd: |
+            if {{ grep }} tap /proc/net/dev
+            then
+              {{ pkill }} -9 -u root -f "^{{ sshProcessName }}"
+            fi
+      when:
+        cleanOldTunnels == true
+      tags:
+        - cleanup
+    - name: Tear down any existing patch bridge
+      shell:
+        cmd: |
+          {{ ip }} link set dev hub down || exit 1
+          {{ ip }} link delete hub || exit 2
+      when:
+        hostvars[inventory_hostname]['ansible_hub'] is defined and cleanOldTunnels == true
+      register: clean_patch_bridge
+      failed_when: clean_patch_bridge.rc > 0
+      tags: cleanup 
+    - name: Create the hub bridge
+      shell:
+        cmd: |
+          {{ ip }} link add hub type bridge || exit 1
+          {{ ip }} address add {{ tapSubnet }}.{{ tapSvi }}/{{ tapMask }} dev hub || exit 2
+          {{ ip }} link set hub up || exit 3 
+      register: taphub_cmd
+      failed_when: taphub_cmd.rc > 0
+    - name: Iterate over peers and stand up the ether-tap network
+      shell:
+        cmd: |
+          read -r -d '' TAPUP <<- _E_O_F_
+          {{ ip }} address add {{ tapSubnet }}.{{ item.0 + 100 }}/{{ tapMask }} dev tap0
+          {{ ip }} link set tap0 up
+          _E_O_F_
+          SSH=$({{ ssh }})
+          {{ nohup }} /bin/bash -c "exec -a {{ sshProcessName }} $SSH {{ sshOpts }} -o Tunnel=ethernet -w {{ item.0 }}:0 -f root@{{ item.1 }} \"${TAPUP}\""
+          COUNT=0
+          while ( [ $COUNT -lt {{ tapUpTime }} ] && ! {{ grep }} tap{{ item.0 }} /proc/net/dev )
+          do
+            sleep 1
+            let COUNT="$COUNT + 1"
+          done
+          {{ grep }} tap{{ item.0 }} /proc/net/dev || exit 1
+          {{ ip }} link set tap{{ item.0 }} up || exit 1
+          if {{ rpm }} -q redhat-release-server-6Server-* >/dev/null
+          then
+            {{ brctl }} addif hub tap{{ item.0 }}
+          else
+            {{ ip }} link set tap{{ item.0 }} master hub
+          fi
+          {{ ping }} -c 2 {{ tapSubnet }}.{{ item.0 + 100 }} >/dev/null || exit 1
+      register: tapup_cmd
+      failed_when: tapup_cmd.rc > 0
+      with_indexed_items: "{{ groups['all'] }}"
+    - name: configure policy routing for the SDN
+      shell:
+        cmd: |
+          {{ ip }} route add {{ tapSubnet }}.{{ tapSvi }} scope link dev hub || exit 1
+          {{ ip }} rule add from {{ tapSubnet }}.0/{{ tapMask }} table {{ tapTable }} || exit 2
+          {{ ip }} route add default via {{ tapSubnet }}.{{ tapSvi }} dev hub table {{ tapTable }} || exit 3
+      register: policyRoute
+      failed_when: policyRoute.rc > 0
+    - name: enable forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        sysctl_set: yes
